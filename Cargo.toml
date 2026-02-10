@@ -1,0 +1,8 @@
+[package]
+name = "interrupt-read"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["log"]
+log = []
