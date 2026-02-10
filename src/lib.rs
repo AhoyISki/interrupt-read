@@ -24,6 +24,7 @@
 use std::{
     io::{BufRead, Cursor, Error, ErrorKind, Read, Take},
     sync::mpsc,
+    thread::JoinHandle,
 };
 
 /// Returns a pair of an [`InterruptReader`] and an [`Interruptor`].
@@ -50,11 +51,11 @@ use std::{
 ///
 /// [`Error`]: std::io::Error
 /// [`ErrorKind::Interrupted`]: std::io::ErrorKind::Interrupted
-pub fn pair(mut reader: impl Read + Send + 'static) -> (InterruptReader, Interruptor) {
+pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Interruptor) {
     let (event_tx, event_rx) = mpsc::channel();
     let (buffer_tx, buffer_rx) = mpsc::channel();
 
-    std::thread::spawn({
+    let join_handle = std::thread::spawn({
         let event_tx = event_tx.clone();
         move || {
             // Same capacity as BufReader
@@ -67,18 +68,18 @@ pub fn pair(mut reader: impl Read + Send + 'static) -> (InterruptReader, Interru
                         // will be done.
                         let event = Event::Buf(std::mem::take(&mut buf), num_bytes);
                         if event_tx.send(event).is_err() {
-                            break;
+                            break reader;
                         }
 
                         buf = match buffer_rx.recv() {
                             Ok(buf) => buf,
                             // Same as before.
-                            Err(_) => break,
+                            Err(_) => break reader,
                         }
                     }
                     Err(err) => {
                         if event_tx.send(Event::Err(err)).is_err() {
-                            break;
+                            break reader;
                         }
                     }
                 }
@@ -86,20 +87,44 @@ pub fn pair(mut reader: impl Read + Send + 'static) -> (InterruptReader, Interru
         }
     });
 
-    let interrupt_reader = InterruptReader { cursor: None, buffer_tx, event_rx };
+    let interrupt_reader = InterruptReader {
+        cursor: None,
+        buffer_tx,
+        event_rx,
+        join_handle,
+    };
     let interruptor = Interruptor(event_tx);
 
     (interrupt_reader, interruptor)
 }
 
 #[derive(Debug)]
-pub struct InterruptReader {
+pub struct InterruptReader<R> {
     cursor: Option<Take<Cursor<Vec<u8>>>>,
     buffer_tx: mpsc::Sender<Vec<u8>>,
     event_rx: mpsc::Receiver<Event>,
+    join_handle: JoinHandle<R>,
 }
 
-impl Read for InterruptReader {
+impl<R: Read> InterruptReader<R> {
+    /// Unwraps this `InterruptReader`, returning the underlying
+    /// reader.
+    ///
+    /// Note that any leftover data in the internal buffer is lost.
+    /// Therefore, a following read from the underlying reader may
+    /// lead to data loss.
+    ///
+    /// This may return [`Err`] if the underlying joined thread has
+    /// panicked, probably because the [`Read`]er has done so.
+    pub fn into_inner(self) -> std::thread::Result<R> {
+        let Self { buffer_tx, event_rx, join_handle, .. } = self;
+        drop(event_rx);
+        drop(buffer_tx);
+        join_handle.join()
+    }
+}
+
+impl<R: Read> Read for InterruptReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if let Some(cursor) = self.cursor.as_mut() {
             deal_with_interrupt(&self.event_rx)?;
@@ -130,7 +155,7 @@ impl Read for InterruptReader {
     }
 }
 
-impl BufRead for InterruptReader {
+impl<R: Read> BufRead for InterruptReader<R> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         if let Some(cursor) = self.cursor.as_mut() {
             deal_with_interrupt(&self.event_rx)?;
