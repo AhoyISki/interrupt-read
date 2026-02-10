@@ -6,8 +6,10 @@
 //! returns an [`mpsc`] channel backed pair.
 //!
 //! When [`Interruptor::interrupt`] is called, the `InterruptReader`
-//! will return an erro of kind [`ErrorKind::Interrupted`]. Otherwise,
-//! it will act like any normal `Read` struct.
+//! will return an erro of kind [`ErrorKind::Other`] with a payload of
+//! [`InterruptReceived`] (you can check for that using the
+//! [`is_interrupt`] function). Otherwise, it will act like any normal
+//! `Read` struct.
 //!
 //! Some things to note about this crate:
 //!
@@ -20,9 +22,19 @@
 //!   the spawned thread will only terminate if the
 //!   [`InterruptReader`] is dropped.
 //!
+//! # Note
+//!
+//! The reason why this function returns [`ErrorKind::Other`], rather
+//! than [`ErrorKind::Interrupted`] is that the latter error is
+//! ignored by functions like [`BufRead::read_line`] and
+//! [`BufRead::read_until`], which is probably not what you want to
+//! happen.
+//!
 //! [`BufReader`]: std::io::BufReader
+//! [`ErrorKind::Other`]: std::io::ErrorKind::Other
+//! [`ErrorKind::Interrupted`]: std::io::ErrorKind::Interrupted
 use std::{
-    io::{BufRead, Cursor, Error, ErrorKind, Read, Take},
+    io::{BufRead, Cursor, Error, Read, Take},
     sync::mpsc,
     thread::JoinHandle,
 };
@@ -39,8 +51,12 @@ use std::{
 /// In the former case, it works just like a regular read, giving an
 /// [`std::io::Result`], depending on the operation.
 /// If the latter happens, however, an [`Error`] of type
-/// [`ErrorKind::Interrupted`] will be received, meaning that reading
-/// operations have been interrupted for some user defined reason.
+/// [`ErrorKind::Other`] with a payload of [`InterruptReceived`],
+/// meaning that reading operations have been interrupted for some
+/// user defined reason.
+///
+/// You can check if an [`std::io::Error`] is of this type by
+/// calling the [`is_interrupt`] function.
 ///
 /// If the channel was interrupted this way, further reads will work
 /// just fine, until another interrupt comes through, creating a
@@ -50,7 +66,7 @@ use std::{
 /// thread, but no timeout is used, all operations are blocking.
 ///
 /// [`Error`]: std::io::Error
-/// [`ErrorKind::Interrupted`]: std::io::ErrorKind::Interrupted
+/// [`ErrorKind::Other`]: std::io::ErrorKind::Other
 pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Interruptor) {
     let (event_tx, event_rx) = mpsc::channel();
     let (buffer_tx, buffer_rx) = mpsc::channel();
@@ -98,6 +114,83 @@ pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Int
     (interrupt_reader, interruptor)
 }
 
+/// An interruptable, buffered [`Read`]er.
+///
+/// This reader is created by wrapping a `Read` struct in the
+/// [`interrupt_read::pair`] function, which also returns an
+/// [`Interruptor`], which is capable of sending interrupt signals,
+/// which make any `read` operations on the `InterruptReader` return
+/// an error of kind [`ErrorKind::Other`], with a payload of
+/// [`InterruptReceived`].
+///
+/// You can check if an [`std::io::Error`] is of this type by
+/// calling the [`is_interrupt`] function.
+///
+/// # Examples
+///
+/// One potential application of this struct is if you want to stop a
+/// thread that is reading from the stdout of a child process without
+/// necessarily terminating said childrop_:
+///
+/// ```rust
+/// use std::{
+///     io::{BufRead, ErrorKind},
+///     process::{Child, Command, Stdio},
+///     time::Duration,
+/// };
+///
+/// use interrupt_read::{is_interrupt, pair};
+///
+/// struct ChildKiller(Child);
+/// impl Drop for ChildKiller {
+///     fn drop(&mut self) {
+///         _ = self.0.kill();
+///     }
+/// }
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// // Prints "hello\n" every second forever.
+/// let mut child = Command::new("bash")
+///     .args(["-c", r#"while true; do echo "hello"; sleep 1; done"#])
+///     .stdout(Stdio::piped())
+///     .spawn()
+///     .unwrap();
+///
+/// let (mut stdout, interruptor) = pair(child.stdout.take().unwrap());
+/// let _child_killer = ChildKiller(child);
+///
+/// let join_handle = std::thread::spawn(move || {
+///     let mut string = String::new();
+///     loop {
+///         match stdout.read_line(&mut string) {
+///             Ok(0) => break Ok(string),
+///             Ok(_) => {}
+///             Err(err) if is_interrupt(&err) => {
+///                 break Ok(string);
+///             }
+///             Err(err) => break Err(err),
+///         }
+///     }
+/// });
+///
+/// std::thread::sleep(Duration::new(3, 1_000_000));
+///
+/// interruptor.interrupt()?;
+///
+/// let result = join_handle.join().unwrap()?;
+///
+/// assert_eq!(result, "hello\nhello\nhello\n");
+///
+/// Ok(())
+/// # }
+/// # match main() {
+/// #     Ok(()) => {}
+/// #     Err(err) => panic!("{err}")
+/// # }
+/// ```
+///
+/// [`interrupt_read::pair`]: pair
+/// [`ErrorKind::Other`]: std::io::ErrorKind::Other
 #[derive(Debug)]
 pub struct InterruptReader<R> {
     cursor: Option<Take<Cursor<Vec<u8>>>>,
@@ -202,7 +295,7 @@ impl<R: Read> BufRead for InterruptReader<R> {
 /// An interruptor for an [`InterruptReader`].
 ///
 /// This struct serves the purpose of interrupting any of the [`Read`]
-/// or [`ReadBuf`] functions being performend on the `InterruptReader`
+/// or [`BufRead`] functions being performend on the `InterruptReader`
 ///
 /// If it is dropped, the `InterruptReader` will no longer be able to
 /// be interrupted.
@@ -214,11 +307,18 @@ impl Interruptor {
     ///
     /// This will send an interrupt event to the reader, which makes
     /// the next `read` operation return [`Err`], with an
-    /// [`ErrorKind::Interrupted`].
+    /// [`ErrorKind::Other`] with a payload of [`InterruptReceived`].
+    ///
+    /// You can check if an [`std::io::Error`] is of this type by
+    /// calling the [`is_interrupt`] function.
     ///
     /// Subsequent `read` operations proceed as normal.
-    pub fn interrupt(&self) -> Result<(), InterruptError> {
-        self.0.send(Event::Interrupt).map_err(|_| InterruptError)
+    ///
+    /// [`ErrorKind::Other`]: std::io::ErrorKind::Other
+    pub fn interrupt(&self) -> Result<(), InterruptSendError> {
+        self.0
+            .send(Event::Interrupt)
+            .map_err(|_| InterruptSendError)
     }
 }
 
@@ -227,15 +327,29 @@ impl Interruptor {
 /// This means that the receiving [`InterruptReader`] has been
 /// dropped.
 #[derive(Debug, Clone, Copy)]
-pub struct InterruptError;
+pub struct InterruptSendError;
 
-impl std::fmt::Display for InterruptError {
+impl std::fmt::Display for InterruptSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("InterruptError")
+        f.write_str("InterruptReader has been dropped")
     }
 }
 
-impl std::error::Error for InterruptError {}
+impl std::error::Error for InterruptSendError {}
+
+/// Indicates that an [`Interruptor`] has called
+/// [`Interruptor::interrupt`], causing a read operation to be
+/// interrupted.
+#[derive(Debug, Clone, Copy)]
+pub struct InterruptReceived;
+
+impl std::fmt::Display for InterruptReceived {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Interruptor has interrupted")
+    }
+}
+
+impl std::error::Error for InterruptReceived {}
 
 #[derive(Debug)]
 enum Event {
@@ -244,11 +358,17 @@ enum Event {
     Interrupt,
 }
 
+/// Wether the error in question originated from an [`Interruptor`]
+/// calling [`Interruptor::interrupt`].
+///
+/// This just checks if the error is of type [`InterruptReceived`]..
+pub fn is_interrupt(err: &Error) -> bool {
+    err.get_ref()
+        .is_some_and(|err| err.is::<InterruptReceived>())
+}
+
 fn interrupt_error() -> Error {
-    Error::new(
-        ErrorKind::Interrupted,
-        "An Interruptor has interrupted this operation.",
-    )
+    Error::other(InterruptReceived)
 }
 
 fn deal_with_interrupt(event_rx: &mpsc::Receiver<Event>) -> std::io::Result<()> {
