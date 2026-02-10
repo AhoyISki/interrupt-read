@@ -2,6 +2,13 @@
 name = "interrupt-read"
 version = "0.1.0"
 edition = "2024"
+authors = ["AhoyISki"]
+description = "An simple implementation of an interruptable reader."
+repository = "https://github.com/AhoyISki/interrupt-read"
+licence = "MIT"
+readme = "README.md"
+keywords = ["io", "channel", "buffer"]
+categories = ["rust-patterns", "data-structures"]
 
 [features]
 default = ["log"]
