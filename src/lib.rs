@@ -11,6 +11,10 @@
 //! [`is_interrupt`] function). Otherwise, it will act like any normal
 //! `Read` struct.
 //!
+//! When an interrupt is received, _the underlying data is not lost_,
+//! it still exists, and if you call a reading function again, it will
+//! be retrieved, unless another interrupt is sent before that.
+//!
 //! Some things to note about this crate:
 //!
 //! - It functions by spawning a separate thread, which will actually
@@ -33,6 +37,7 @@
 //! [`BufReader`]: std::io::BufReader
 //! [`ErrorKind::Other`]: std::io::ErrorKind::Other
 //! [`ErrorKind::Interrupted`]: std::io::ErrorKind::Interrupted
+//! [`interrupt_reader::pair`]: pair
 use std::{
     io::{BufRead, Cursor, Error, Read, Take},
     sync::mpsc,
@@ -123,6 +128,10 @@ pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Int
 /// an error of kind [`ErrorKind::Other`], with a payload of
 /// [`InterruptReceived`].
 ///
+/// When an interrupt is received, _the underlying data is not lost_,
+/// it still exists, and if you call a reading function again, it will
+/// be retrieved, unless another interrupt is sent before that.
+///
 /// You can check if an [`std::io::Error`] is of this type by
 /// calling the [`is_interrupt`] function.
 ///
@@ -148,6 +157,10 @@ pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Int
 ///     }
 /// }
 ///
+/// # match main() {
+/// #     Ok(()) => {}
+/// #     Err(err) => panic!("{err}")
+/// # }
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// // Prints "hello\n" every second forever.
 /// let mut child = Command::new("bash")
@@ -183,10 +196,6 @@ pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Int
 ///
 /// Ok(())
 /// # }
-/// # match main() {
-/// #     Ok(()) => {}
-/// #     Err(err) => panic!("{err}")
-/// # }
 /// ```
 ///
 /// [`interrupt_read::pair`]: pair
@@ -211,8 +220,7 @@ impl<R: Read> InterruptReader<R> {
     /// panicked, probably because the [`Read`]er has done so.
     pub fn into_inner(self) -> std::thread::Result<R> {
         let Self { buffer_tx, event_rx, join_handle, .. } = self;
-        drop(event_rx);
-        drop(buffer_tx);
+        drop((event_rx, buffer_tx));
         join_handle.join()
     }
 }
@@ -322,7 +330,7 @@ impl Interruptor {
     }
 }
 
-/// An error ocurred while calling [`Interruptor::interrupt`].
+/// An error occurred while calling [`Interruptor::interrupt`].
 ///
 /// This means that the receiving [`InterruptReader`] has been
 /// dropped.
@@ -361,7 +369,28 @@ enum Event {
 /// Wether the error in question originated from an [`Interruptor`]
 /// calling [`Interruptor::interrupt`].
 ///
-/// This just checks if the error is of type [`InterruptReceived`]..
+/// This just checks if the error is of type [`InterruptReceived`].
+///
+/// # Examples
+///
+/// ```
+/// use std::io::{BufRead, Read, Result};
+///
+/// use interrupt_read::{InterruptReader, is_interrupt};
+///
+/// // Read until either `Ok(0)` or an interrupt occurred.
+/// fn interrupt_read_loop(mut reader: InterruptReader<impl Read>) -> Result<String> {
+///     let mut string = String::new();
+///     loop {
+///         match reader.read_line(&mut string) {
+///             Ok(0) => break Ok(string),
+///             Ok(_) => {}
+///             Err(err) if is_interrupt(&err) => break Ok(string),
+///             Err(err) => break Err(err),
+///         }
+///     }
+/// }
+/// ```
 pub fn is_interrupt(err: &Error) -> bool {
     err.get_ref()
         .is_some_and(|err| err.is::<InterruptReceived>())
