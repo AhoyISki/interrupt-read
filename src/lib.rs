@@ -40,7 +40,11 @@
 //! [`interrupt_reader::pair`]: pair
 use std::{
     io::{BufRead, Cursor, Error, Read, Take},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+        mpsc,
+    },
     thread::JoinHandle,
 };
 
@@ -75,14 +79,17 @@ use std::{
 pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Interruptor) {
     let (event_tx, event_rx) = mpsc::channel();
     let (buffer_tx, buffer_rx) = mpsc::channel();
+    let is_reading = Arc::new(AtomicBool::new(true));
 
     let join_handle = std::thread::spawn({
         let event_tx = event_tx.clone();
+        let is_reading = is_reading.clone();
         move || {
             // Same capacity as BufReader
             let mut buf = vec![0; 8 * 1024];
+            is_reading.store(true, Relaxed);
 
-            loop {
+            let reader = loop {
                 match reader.read(&mut buf) {
                     Ok(num_bytes) => {
                         // This means the InterruptReader has been dropped, so no more reading
@@ -104,11 +111,14 @@ pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Int
                         }
                     }
                 }
-            }
+            };
+            is_reading.store(false, Relaxed);
+            reader
         }
     });
 
     let interrupt_reader = InterruptReader {
+        is_reading,
         cursor: None,
         buffer_tx,
         event_rx,
@@ -202,6 +212,7 @@ pub fn pair<R: Read + Send + 'static>(mut reader: R) -> (InterruptReader<R>, Int
 /// [`ErrorKind::Other`]: std::io::ErrorKind::Other
 #[derive(Debug)]
 pub struct InterruptReader<R> {
+    is_reading: Arc<AtomicBool>,
     cursor: Option<Take<Cursor<Vec<u8>>>>,
     buffer_tx: mpsc::Sender<Vec<u8>>,
     event_rx: mpsc::Receiver<Event>,
@@ -222,6 +233,18 @@ impl<R: Read> InterruptReader<R> {
         let Self { buffer_tx, event_rx, join_handle, .. } = self;
         drop((event_rx, buffer_tx));
         join_handle.join()
+    }
+
+    /// Wether the reader thread is still active.
+    pub fn is_reading(&self) -> bool {
+        self.is_reading.load(Relaxed)
+    }
+
+    /// A function that returns `true` if the reader thread is still
+    /// active.
+    pub fn is_reading_fn(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let is_reading = self.is_reading.clone();
+        move || is_reading.load(Relaxed)
     }
 }
 
